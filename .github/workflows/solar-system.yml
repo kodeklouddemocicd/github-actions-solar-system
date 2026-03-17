@@ -1,4 +1,8 @@
 name: Solar System Workflow
+env:
+  MONGO_URI: 'mongodb+srv://supercluster.d83jj.mongodb.net/superData'
+  MONGO_USERNAME: superuser
+  MONGO_PASSWORD: ${{ secrets.MONGO_PASSWORD }}
 
 on: 
   workflow_dispatch:
@@ -8,26 +12,307 @@ on:
       - 'feature/*'
     
 jobs:
+    code-coverage:
+        name: Code Coverage test
+        runs-on: ubuntu-latest
+        steps:
+          - name: Checkout
+            uses: actions/checkout@v4
+
+          - name: NodeJS Version
+            uses: actions/setup-node@v4
+            with:
+             node-version: 18
+
+          - name: Install Dependencies
+            run: npm install
+
+          - name: Run code coverage test
+            run: npm run coverage
+            continue-on-error: true
+
+          - name: Code Coverage result
+            uses: actions/upload-artifact@v4
+            with:
+              name: Code-Coverage-Result
+              path: coverage
+              retention-days: 5
+            
     unit-testing:
         name: Unit Testing
         runs-on: ubuntu-latest
+        container:
+          image: 'node:20'
         steps:
         - name: Checkout Repository
           uses: actions/checkout@v4
-
-        - name: Setup NodeJS Version
-          uses: actions/setup-node@v4
+        
+        - name: Cache NPM dependencies
+          uses: actions/cache@v5
           with:
-            node-version: 20
+            key: ${{runner.os}}-node-modules-${{hashFiles('package-lock.json')}}
+            path: ~/.npm
     
         - name: Install Dependencies
           run: npm install
     
         - name: Unit Testing
+          env:
+            MONGO_URI: 'mongodb+srv://supercluster.d83jj.mongodb.net/superData'
+            MONGO_USERNAME: superuser
+            MONGO_PASSWORD: ${{ secrets.MONGO_PASSWORD }}
           run: npm test
           
         - name: Archive Test Result
+          if: always()
           uses: actions/upload-artifact@v4
           with:
             name: Mocha-Test-Result
             path: test-results.xml
+
+    docker:
+      name: Docker
+      needs: [code-coverage, unit-testing]
+      runs-on: ubuntu-latest
+      steps:
+        - name: Checkout Repository
+          uses: actions/checkout@v4
+
+        - name: Docker login action
+          uses: docker/login-action@v4
+          with:
+            username: ${{vars.DOCKER_USERNAME}}
+            password: ${{secrets.DOCKER_PASSWORD}}
+       
+        - name: Docker build and push image
+          uses: docker/build-push-action@v6
+          with:
+            context: .
+            push: true
+            tags: andreir76/solar-system-test
+
+        - name: docker image test
+          run: |
+           docker images
+           docker run --name solar-system -d \
+            -p 3000:3000 \
+            -e MONGO_URI=$MONGO_URI \
+            -e MONGO_USERNAME=$MONGO_USERNAME \
+            -e MONGO_PASSWORD=$MONGO_PASSWORD \
+            andreir76/solar-system-test
+           export CONTAINER_IP=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' solar-system)
+           echo $CONTAINER_IP
+           wget -q -O - 127.0.0.1:3000/live | grep live
+    
+    dev-deploy:
+      runs-on: ubuntu-latest
+      needs: docker
+      environment:
+        name: development
+      if: contains(github.ref, 'feature/')
+      steps:
+       - name: Checkout Repository
+         uses: actions/checkout@v4
+
+       - name: Install kubernetes cluster for testing purposes
+         uses: helm/kind-action@v1
+         with:
+          config: ./kind-config.yaml
+
+       - name: Install nginx ingress controller
+         run: kubectl apply -f https://raw.githubusercontent.com/kubernetes/ingress-nginx/main/deploy/static/provider/kind/deploy.yaml
+
+       - name: Wait for nginx ingress to be ready
+         run: |
+           kubectl wait --namespace ingress-nginx \
+             --for=condition=ready pod \
+             --selector=app.kubernetes.io/component=controller \
+             --timeout=120s
+           sleep 10
+
+       - name: create kubernetes namespace
+         run: kubectl create namespace ${{vars.KUBERNETES_MANIFEST_NAMESPACE}} --dry-run=client -o yaml | kubectl apply -f -
+
+
+       - name: create mongodb secret
+         run: |
+          kubectl -n ${{vars.KUBERNETES_MANIFEST_NAMESPACE}} create secret generic mongo-db-creds \
+          --from-literal=MONGO_URI=${{env.MONGO_URI}} \
+          --from-literal=MONGO_USERNAME=${{env.MONGO_USERNAME}} \
+          --from-literal=MONGO_PASSWORD=${{secrets.MONGO_PASSWORD}} \
+          --save-config \
+          --dry-run=client \
+          -o yaml | kubectl apply -f -
+
+       - name: Replace tokens in kubernetes yaml files
+         uses: cschleiden/replace-tokens@v1
+         with:
+          tokenPrefix: '_{_'
+          tokenSuffix: '_}_'
+          files: '["kubernetes/development/*.yaml"]'
+         env:
+          NAMESPACE: ${{vars.KUBERNETES_MANIFEST_NAMESPACE}}
+          REPLICAS: ${{vars.KUBERNETES_MANIFEST_REPLICAS}}
+          IMAGE: ${{vars.DOCKER_USERNAME}}/solar-system-test
+          INGRESS_IP: 127.0.0.1
+        
+       - name: apply and display kubernetes pods
+         id: get_all_step
+         run: |
+          kubectl apply -f kubernetes/${{vars.KUBERNETES_MANIFEST_NAMESPACE}}
+          kubectl get all -n ${{vars.KUBERNETES_MANIFEST_NAMESPACE}}
+          kubectl -n ${{vars.KUBERNETES_MANIFEST_NAMESPACE}} get ing
+          echo "APP_INGRESS_HOST=$(kubectl -n ${{vars.KUBERNETES_MANIFEST_NAMESPACE}} get ing -o jsonpath="{.items[0].spec.tls[0].hosts[0]}")" >> $GITHUB_ENV
+
+       - name: Wait for Solar System App
+         run: |
+          kubectl wait --namespace ${{vars.KUBERNETES_MANIFEST_NAMESPACE}} \
+            --for=condition=available deployment/solar-system \
+            --timeout=60s
+
+       - name: test url using curl
+         run: |
+           echo "HOST: ${{env.APP_INGRESS_HOST}}"
+           echo "URL: https://${{env.APP_INGRESS_HOST}}/live"
+           curl -v https://${{env.APP_INGRESS_HOST}}/live -k > response.txt 2>&1 || true
+           cat response.txt
+
+       - name: Run Integration Test with Retries
+         run: |
+            URL=${{env.APP_INGRESS_HOST}}
+            SUCCESS=false
+            for i in {1..10}; do
+              echo "--- Attempt $i ---"
+              
+              # 1. Get the HTTP status code only (-o /dev/null hides the body)
+              HTTP_STATUS=$(curl -s -k -o /dev/null -w "%{http_code}" https://$URL/live)
+              echo "HTTP Status: $HTTP_STATUS"
+
+              # 2. Only if we get a 200, do we check the JSON body
+              if [ "$HTTP_STATUS" -eq 200 ]; then
+                # We use '|| true' here just as an extra safety measure for the script
+                BODY=$(curl -s -k https://$URL/live)
+                APP_STATE=$(echo "$BODY" | jq -r .status 2>/dev/null || echo "not_json")
+                
+                if [ "$APP_STATE" == "live" ]; then
+                  echo "Success! Application is live and healthy."
+                  SUCCESS=true
+                  break
+                else
+                  echo "App is up (200), but status is: $APP_STATE"
+                fi
+              else
+                echo "Ingress/App not ready yet. Still getting $HTTP_STATUS."
+              fi
+
+              echo "Waiting 5s before next attempt..."
+              sleep 5
+            done
+
+            # 3. Final check: if we never set SUCCESS to true, fail the whole job
+            if [ "$SUCCESS" = false ]; then
+              echo "ERROR: Integration test timed out."
+              exit 1
+            fi
+            
+    prod-deploy:
+          runs-on: ubuntu-latest
+          needs: docker
+          environment:
+            name: production
+          if: github.ref=='refs/heads/main'
+          steps:
+          - name: Checkout Repository
+            uses: actions/checkout@v4
+
+          - name: Install kubernetes cluster for testing purposes
+            uses: helm/kind-action@v1
+            with:
+              config: ./kind-config.yaml
+
+          - name: Install nginx ingress controller
+            run: kubectl apply -f https://raw.githubusercontent.com/kubernetes/ingress-nginx/main/deploy/static/provider/kind/deploy.yaml
+
+          - name: Wait for nginx ingress to be ready
+            run: |
+              kubectl wait --namespace ingress-nginx \
+                --for=condition=ready pod \
+                --selector=app.kubernetes.io/component=controller \
+                --timeout=120s
+              sleep 10
+
+          - name: create kubernetes namespace
+            run: kubectl create namespace ${{vars.KUBERNETES_MANIFEST_NAMESPACE}} --dry-run=client -o yaml | kubectl apply -f -
+
+
+          - name: create mongodb secret
+            run: |
+              kubectl -n ${{vars.KUBERNETES_MANIFEST_NAMESPACE}} create secret generic mongo-db-creds \
+              --from-literal=MONGO_URI=${{env.MONGO_URI}} \
+              --from-literal=MONGO_USERNAME=${{env.MONGO_USERNAME}} \
+              --from-literal=MONGO_PASSWORD=${{secrets.MONGO_PASSWORD}} \
+              --save-config \
+              --dry-run=client \
+              -o yaml | kubectl apply -f -
+
+          - name: Replace tokens in kubernetes yaml files
+            uses: cschleiden/replace-tokens@v1
+            with:
+              tokenPrefix: '_{_'
+              tokenSuffix: '_}_'
+              files: '["kubernetes/${{vars.KUBERNETES_MANIFEST_NAMESPACE}}/*.yaml"]'
+            env:
+              NAMESPACE: ${{vars.KUBERNETES_MANIFEST_NAMESPACE}}
+              REPLICAS: ${{vars.KUBERNETES_MANIFEST_REPLICAS}}
+              IMAGE: ${{vars.DOCKER_USERNAME}}/solar-system-test
+              INGRESS_IP: 127.0.0.1
+            
+          - name: apply and display kubernetes pods
+            id: get_all_step
+            run: |
+              kubectl apply -f kubernetes/${{vars.KUBERNETES_MANIFEST_NAMESPACE}}
+              kubectl get all -n ${{vars.KUBERNETES_MANIFEST_NAMESPACE}}
+              kubectl -n ${{vars.KUBERNETES_MANIFEST_NAMESPACE}} get ing
+              echo "APP_INGRESS_HOST=$(kubectl -n ${{vars.KUBERNETES_MANIFEST_NAMESPACE}} get ing -o jsonpath="{.items[0].spec.tls[0].hosts[0]}")" >> $GITHUB_ENV
+
+          - name: wait for solar system deployment
+            run: |
+              kubectl wait --namespace ${{vars.KUBERNETES_MANIFEST_NAMESPACE}} \
+                --for=condition=available deployment/solar-system \
+                --timeout=60s
+
+          - name: test url using curl
+            run: |
+              echo "HOST: ${{env.APP_INGRESS_HOST}}"
+              echo "URL: https://${{env.APP_INGRESS_HOST}}/live"
+              curl -v https://${{env.APP_INGRESS_HOST}}/live -k > response.txt 2>&1 || true
+              cat response.txt
+
+          - name: integration test 
+            run: |
+                URL=${{env.APP_INGRESS_HOST}}
+                SUCCESS=false
+                for i in {1..10}; do
+                  echo "--- Attempt $i ---"
+                  HTTP_STATUS=$(curl -s -k -o /dev/null -w "%{http_code}" https://$URL/live)
+                  echo "HTTP Status: $HTTP_STATUS"
+                  if [ "$HTTP_STATUS" -eq 200 ]; then
+                    BODY=$(curl -s -k https://$URL/live)
+                    APP_STATE=$(echo "$BODY" | jq -r .status 2>/dev/null || echo "not_json")
+                    if [ "$APP_STATE" == "live" ]; then
+                      echo "application is live"
+                      SUCCESS=true
+                      break
+                    else
+                      echo "status is: $APP_STATE"
+                    fi
+                  else
+                    echo "app not ready, status is $HTTP_STATUS."
+                  fi
+                  echo "waiting for next attempt..."
+                  sleep 5
+                done
+                if [ "$SUCCESS" = false ]; then
+                  echo "integration test timed out."
+                  exit 1
+                fi
