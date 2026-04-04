@@ -21,6 +21,11 @@
           uses: actions/setup-node@v4
           with:
             node-version: 20
+        - name: Cache Dependencies
+          uses: actions/cache@v3
+          with:
+            path: node_modules
+            key: ${{ runner.os }}-node_modules-${{ hashFiles('package-lock.json') }}
         - name: Install Dependencies
           run: npm install
         - name: Unit Testing
@@ -36,6 +41,11 @@
      runs-on: ubuntu-latest
      steps:
      - uses: actions/checkout@v4
+     - name: Cache Dependencies
+       uses: actions/cache@v3
+       with:
+         path: node_modules
+         key: ${{ runner.os }}-node_modules-${{ hashFiles('package-lock.json') }}
      - uses: actions/setup-node@v4
        with:
         node-version: 18
