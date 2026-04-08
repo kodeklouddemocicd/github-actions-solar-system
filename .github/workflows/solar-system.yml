@@ -80,7 +80,7 @@
         path: coverage
         retention-days: 5
 
-    Containerization:
+    docker:
       name: Containerization
       needs: [unit-testing, code-coverage]
       runs-on: ubuntu-latest
