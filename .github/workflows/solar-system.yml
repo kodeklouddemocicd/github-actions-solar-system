@@ -48,6 +48,19 @@
             
     code-coverage:
      runs-on: ubuntu-latest
+     container: 
+      image: node:18
+     services:
+        mongo-db:
+          image: siddharth67/mongo-db:non-prod
+          # ports: no need because there is a bridged network among the job and the service container
+          #   - 27017:27017
+          options: 
+            --name mongo
+     env:
+        MONGO_URI: 'mongodb://mongo:27017/superData' 
+        MONGO_USERNAME: non-prod-user
+        MONGO_PASSWORD: non-prod-password
      steps:
      - uses: actions/checkout@v4
      - name: Cache Dependencies
@@ -55,9 +68,9 @@
        with:
          path: node_modules
          key: ${{ runner.os }}-node_modules-${{ hashFiles('package-lock.json') }}
-     - uses: actions/setup-node@v4
-       with:
-        node-version: 18
+    #  - uses: actions/setup-node@v4
+    #    with:
+    #     node-version: 18
      - run: npm install
      - continue-on-error: true
        run: npm run coverage
