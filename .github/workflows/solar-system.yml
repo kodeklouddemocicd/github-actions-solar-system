@@ -85,8 +85,7 @@
             context: .
             push: false
             tags: ${{ vars.DOCKERHUB_USERNAME }}/solar-system:${{ github.sha }}
-            cache-from: type=gha
-            cache-to: type=gha,mode=max
+            
 
         - name: Docker Image Test
           run: |
