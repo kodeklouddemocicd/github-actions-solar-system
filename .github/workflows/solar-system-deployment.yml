@@ -168,6 +168,10 @@ jobs:
     if: github.ref == 'ref/heads/main'
     needs: docker
     uses: ./.github/workflows/reuse-deployment.yml
+    secrets: 
+      k8s-kubeconfig: ${{ secrets.KUBECONFIG }}
+      mongodb-password: ${{ secrets.MONGO_PASSWORD }}
+      
   prod-integration-testing:
     if: github.ref == 'ref/heads/main'
     name: Integration Testing
