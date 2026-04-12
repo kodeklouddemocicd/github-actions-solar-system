@@ -1,0 +1,22 @@
+name: Checking PR workflows
+on:
+    push: 
+
+jobs:
+    pr-check:
+        strategy:
+            matrix:
+                os: [ubuntu-latest, windows-latest]
+        runs-on: ${{ matrix.os }}
+
+        steps:
+        
+            - name: Checkout Repository
+              uses: actions/checkout@v4
+
+            - name: Using Instacache
+              uses: Ruhanyat-994/custome-actions/.github/custom-actions/insta-cache@development
+              with:
+                node-version: 18
+                install-mode: ci
+                debug: true
