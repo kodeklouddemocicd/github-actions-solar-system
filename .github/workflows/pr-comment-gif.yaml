@@ -1,0 +1,20 @@
+on:
+    pull_request: 
+        types: 
+            - opened
+
+jobs:
+    pr-actions:
+        runs-on: ubuntu-latest
+        permissions: 
+            issues: write
+            pull-requests: write
+
+        steps:
+            - name: Post PR Comment
+              uses: Ruhanyat-994/giphy-api-actions@main
+              with:
+                  github-token: ${{ secrets.GITHUB_TOKEN }}
+                  giphy-api-key: ${{ secrets.GIPHY_API_KEY }}
+
+                  
